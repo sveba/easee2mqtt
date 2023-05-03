@@ -1,0 +1,11 @@
+version: "3"
+services:
+  easee2mqtt:
+    build: ./
+    networks:
+      - network1
+
+networks:
+  network1:
+    name: mosquitto
+    external: true
