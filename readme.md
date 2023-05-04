@@ -7,6 +7,13 @@ Easee has their API documented [here](https://developer.easee.cloud/reference/po
 ## Prerequisites
 Your charging robot needs to be connected to the internet and you need an account on [easee cloud](https://easee.cloud/). You need to have a MQTT-broker and a server, Raspberry Pi or similar with Python installed that can have the program running.
 
+## Docker Handling
+
+`docker-compose build`
+
+`docker-compose run easee2mqtt python3 setup.py`
+
+`docker-compose up -d`
 
 ## Installation
 This is a Python program and has been developed and tested on Python 3.8. 
