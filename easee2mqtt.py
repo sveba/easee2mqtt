@@ -27,7 +27,7 @@ logging.basicConfig(handlers=[RotatingFileHandler(logfile,
 settings = {}
 
 def get_access_token(username,password):
-    url = "https://api.easee.cloud/api/accounts/token"
+    url = "https://api.easee.cloud/api/accounts/login"
 
     headers = {
         "Accept": "application/json",
