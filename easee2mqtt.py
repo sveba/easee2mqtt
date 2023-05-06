@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 
 
 dir_path = os.path.dirname(os.path.realpath(__file__))
-logfile = os.path.join(dir_path, "easeelog.log")
+logfile = os.path.join(dir_path, "logs/easeelog.log")
 print(logfile)
 
 logging.basicConfig(handlers=[RotatingFileHandler(logfile, 
@@ -227,7 +227,7 @@ if __name__ == "__main__":
     logging.info("Script is starting. Looking for settings")
     print("Script is starting. Looking for settings")
     try:
-        settingspath = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'settings.json')
+        settingspath = os.getenv('SETTINGS_FILE') or os.path.join(os.path.dirname(os.path.abspath(__file__)), 'settings.json')
         with open(settingspath) as json_file:
             settings = json.load(json_file)
             try:
