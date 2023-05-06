@@ -118,7 +118,7 @@ def publish_state(charger):
     state = get_state(charger)
     config = get_config(charger)
     latest_session = get_latest_session(charger)
-    latest_pulse = datetime.strptime(state['latestPulse'], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).astimezone(tz=None).strftime("%Y-%m-%d %H:%M:%S")
+    latest_pulse = datetime.strptime(state['latestPulse'], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc).astimezone(tz=None).strftime("%Y-%m-%d %H:%M:%S")
     logging.debug(f"Publish_state - Latest pulse: {latest_pulse}")
     if state['totalPower'] > 0:
         charging_state = "True"
@@ -269,7 +269,9 @@ if __name__ == "__main__":
                 try:
                     logging.debug(f"Fetching and publishing latest stats of {charger}")
                     publish_state(charger)
-                except:
+                except Exception as err:
+                    logging.warning(err)
+                    logging.warning(traceback.format_exc())
                     logging.warning(f"Failed to fetch and publish new stats of {charger}. Will retry in 5 minutes.")
 
             time.sleep(polling_interval)

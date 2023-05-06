@@ -2,6 +2,7 @@ version: "3"
 services:
   easee2mqtt:
     build: ./
+    restart: always
     networks:
       - network1
     volumes:
