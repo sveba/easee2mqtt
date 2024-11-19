@@ -8,43 +8,58 @@ import logging
 import paho.mqtt.client as mqtt
 from requests.api import request
 import os
-import threading
 from datetime import datetime, timezone
 
 
 LOGLEVEL = os.environ.get('LOGLEVEL', 'INFO').upper()
-SETTINGS_JSON = os.environ.get('SETTINGS_JSON', '/app/settings.json')
+easee_username = os.environ.get('EASEE_USERNAME', None)
+easee_password = os.environ.get('EASEE_PASSWORD', None)
+easee_chargers = os.environ.get("EASEE_CHARGERS").split(",")
+polling_interval = int(os.environ.get('POLLING_INTERVAL', 300))
+mqtt_host = os.environ.get('MQTT_HOST', None)
+mqtt_port = int(os.environ.get('MQTT_PORT', 1833))
+mqtt_password = os.environ.get('MQTT_PASSWORD', None)
+mqtt_username = os.environ.get('MQTT_USERNAME', None)
+access_token = None
+token_expiration = time.time()
+
 logging.basicConfig(handlers=[logging.StreamHandler(sys.stdout)],
                     level=LOGLEVEL,
                     format="[%(asctime)s] %(levelname)s %(message)s",
                     datefmt='%Y-%m-%d %H:%M:%S')
 
-settings = {}
+def check_access_token():
+    global access_token, token_expiration, easee_username, easee_password
+    if token_expiration - time.time() < 350:
+        logging.info("Token expires in less than 350 seconds. Fetching a new token.")
+    
+        url = "https://api.easee.cloud/api/accounts/login"
 
-def get_access_token(username,password):
-    url = "https://api.easee.cloud/api/accounts/login"
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json-patch+json"
+        }
 
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json-patch+json"
-    }
+        body = {
+            "userName": easee_username,
+            "password": easee_password
+        }
 
-    body = {
-        "userName": username,
-        "password": password
-    }
+        response = requests.request("POST", url, headers=headers, json=body)
+        logging.debug(f"Response from get_access_log: {response}")
+        if response.status_code == 200:
+            logging.info("Successfully connected to Easee")
+        else:
+            logging.warning("Failed to connect to Easee. Response code: "
+                            f"{response.status_code}")
+            return False
+        json_obj = json.loads(response.text)
+        token_expiration = time.time() + json_obj['expiresIn']
+        access_token = json_obj['accessToken']
 
-    response = requests.request("POST", url, headers=headers, json=body)
-    logging.debug(f"Response from get_access_log: {response}")
-    if response.status_code == 200:
-        logging.info("Successfully connected to Easee")
+        logging.info("Successfully retrieved and stored a new token.")
     else:
-        logging.warning("Failed to connect to Easee. Response code: "
-                        f"{response.status_code}")
-        return False
-    json_obj = json.loads(response.text)
-    expiry = time.time() + json_obj['expiresIn']
-    return json_obj['accessToken'], expiry
+        logging.debug("Token is not up for refresh.")
 
 
 def response_codes(code):
@@ -78,11 +93,13 @@ def convertToAF(code):
         return f"Unknown state code: {code}"
 
 def get_latest_session(charger_id):
+    global access_token
+    check_access_token()
     details_url = f"https://api.easee.cloud/api/chargers/{charger_id}/sessions/latest"
 
     headers = {
         "Accept": "application/json",
-        "Authorization": "Bearer " + settings['access_token']}
+        "Authorization": "Bearer " + access_token}
 
     resp = requests.request("GET", url = details_url, headers = headers)
     parsed = resp.json()
@@ -90,26 +107,13 @@ def get_latest_session(charger_id):
         logging.warning(f"Response code {resp.status_code} when trying to get_latest_session")
     return parsed
 
-
-def check_expiration():
-    global settings
-    if settings['expiry'] - time.time() < 350:
-        logging.info("Token expires in less than 350 seconds. Fetching a new token.")
-        access_token, expiry = get_access_token(settings['easee_username'], settings['easee_password'])
-        settings['access_token'] = access_token
-        settings['expiry'] = expiry
-        with open(SETTINGS_JSON, 'w') as fp:
-            json.dump(settings, fp, indent=4, sort_keys=True)
-        logging.info("Successfully retrieved and stored a new token.")
-    else:
-        logging.debug("Token is not up for refresh.")
-
-
 def get_state(charger_id):
+    global access_token
+    check_access_token()
     url = f"https://api.easee.cloud/api/chargers/{charger_id}/state"
     headers = {
         "Accept": "application/json",
-        "Authorization": "Bearer " + settings['access_token']}
+        "Authorization": "Bearer " + access_token}
     resp = requests.request("GET", url = url, headers=headers)
     parsed = resp.json()
     logging.debug("State")
@@ -119,21 +123,12 @@ def get_state(charger_id):
     return parsed
 
 
-def publish_state(charger):
+def publish_state(client, charger):
     state = get_state(charger)
     config = get_config(charger)
     latest_session = get_latest_session(charger)
     latest_pulse = datetime.strptime(state['latestPulse'], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc).astimezone(tz=None).strftime("%Y-%m-%d %H:%M:%S")
     logging.debug(f"Publish_state - Latest pulse: {latest_pulse}")
-    if state['totalPower'] > 0:
-        charging_state = "True"
-    else:
-        charging_state = "False"
-
-    if state['totalPower'] > 0:
-        charging_state = "True"
-    else:
-        charging_state = "False"
 
     client.publish(f"easee2MQTT/{charger}/energy_consumption", round(state['lifetimeEnergy'],2))
     client.publish(f"easee2MQTT/{charger}/current_session", round(state['sessionEnergy'],2))
@@ -142,7 +137,6 @@ def publish_state(charger):
     client.publish(f"easee2MQTT/{charger}/power", round(state['totalPower'],2))
     client.publish(f"easee2MQTT/{charger}/cable_lock", state['cableLocked'])
     client.publish(f"easee2MQTT/{charger}/charging_enabled", config['isEnabled'])
-    client.publish(f"easee2MQTT/{charger}/charging", charging_state)
     client.publish(f"easee2MQTT/{charger}/smartcharging_enabled", state['smartCharging'])
     client.publish(f"easee2MQTT/{charger}/latest_pulse", latest_pulse)
     client.publish(f"easee2MQTT/{charger}/charging_current", state['dynamicChargerCurrent'])
@@ -151,10 +145,11 @@ def publish_state(charger):
 
 def on_message(client, userdata, message):
     logging.info(f"Message received on topic: {message.topic}, payload: {str(message.payload.decode('utf-8'))}")
+    global access_token
     charger = message.topic.split("/")[1]
     headers = {
             "Accept": "application/json",
-            "Authorization": "Bearer " + settings['access_token']}
+            "Authorization": "Bearer " + access_token}
 
     if message.topic.split("/")[2] == "cable_lock":
         url = "https://api.easee.cloud/api/chargers/"+charger+"/commands/lock_state"
@@ -177,11 +172,6 @@ def on_message(client, userdata, message):
         else:
             logging.warning("Couldn't identify payload. 'true' or 'false' is only supported values.")
 
-
-    elif message.topic.split("/")[2] == "ping":
-        logging.info("Running publish_state from a manual ping")
-        publish_state(charger)
-
     elif message.topic.split("/")[2] == "smartcharging_enabled":
         if (str(message.payload.decode("utf-8")).casefold() == "true" or
             str(message.payload.decode("utf-8")).casefold() == "false"):
@@ -202,14 +192,11 @@ def on_message(client, userdata, message):
             callback_topic = f"easee2MQTT/{charger}/charging_current"
         else:
             logging.warning(f"Couldn't publish new charging_current")
-
+    
     try:
         if message.topic.split("/")[2] != "ping":
             logging.info(f"Manually publishing setting {message.topic.split('/')[2]} for {charger}")
-            client.publish(callback_topic, message.payload.decode('utf-8'))
-            t = threading.Timer(15.0, publish_state, [charger])
-            t.start()
-
+            client.publish(callback_topic, message.payload.decode('utf-8')) 
     except:
         logging.warning(f"Couldn't publish manually for message: {message}")
 
@@ -227,38 +214,24 @@ def get_config(charger):
     url = "https://api.easee.cloud/api/chargers/"+charger+"/config"
     headers = {
         "Accept": "application/json",
-        "Authorization": "Bearer " + settings['access_token']}
+        "Authorization": "Bearer " + access_token}
     resp = requests.request("GET", url = url, headers=headers)
     parsed = resp.json()
     if resp.status_code != 200:
         logging.warning(f"Response code {resp.status_code} when trying to get_latest_session")
     return parsed
 
-if __name__ == "__main__":
+def main():
     logging.info("Script is starting. Looking for settings")
-    print("Script is starting. Looking for settings")
-    try:
-        with open(SETTINGS_JSON) as json_file:
-            settings = json.load(json_file)
-            try:
-                polling_interval = settings['polling_interval']
-            except KeyError:
-                logging.info("Couldn't find polling_interval in settings, defaulting to 300s")
-                polling_interval = 300
-        logging.info("Successfully opened settings.")
-    except FileNotFoundError:
-        logging.error(f"Couldn't find settings. Run setup.py and make sure you are in the right folder")
-        sys.exit()
-
-    check_expiration()
-
+    global easee_chargers, mqtt_host, mqtt_port, mqtt_username, mqtt_password, polling_interval
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,"Easee2MQTT")
-    if "mqtt_password" in settings:
-        client.username_pw_set(username=settings['mqtt_username'], password=settings['mqtt_password'])
-    client.connect(settings['mqtt_adress'], port=settings['mqtt_port'])
+    logging.debug(f"MQTT: Connect to {mqtt_host}:{mqtt_port}")
+    if mqtt_password:
+        client.username_pw_set(username=mqtt_username, password=mqtt_password)
+    client.connect(mqtt_host, mqtt_port)
     client.loop_start()
 
-    for charger in settings['chargers']:
+    for charger in easee_chargers:
         logging.info(f"Subscribing to topics for charger {charger}.")
         client.subscribe("easee2MQTT/"+charger+"/cable_lock/set")
         client.subscribe("easee2MQTT/"+charger+"/charging_enabled/set")
@@ -267,25 +240,23 @@ if __name__ == "__main__":
         client.subscribe("easee2MQTT/"+charger+"/charging_current/set")
     client.on_message = on_message
 
-
     try:
         while True:
-            try:
-                check_expiration()
-            except:
-                logging.error("Failed to check expiration. Retrying in {polling_interval} seconds")
-
-            for charger in settings['chargers']:
+            for charger in easee_chargers:
                 try:
                     logging.debug(f"Fetching and publishing latest stats of {charger}")
-                    publish_state(charger)
+                    publish_state(client, charger)
                 except Exception as err:
                     logging.error(err)
-                    logging.error(traceback.format_exc())
                     logging.error(f"Failed to fetch and publish new stats of {charger}. Will retry in {polling_interval} seconds")
 
             time.sleep(polling_interval)
+    except Exception as err:
+        logging.error(err)
+    client.loop_stop()
 
+if __name__ == "__main__":
+    try:
+        main()
     except KeyboardInterrupt:
         print("Exiting program")
-        client.loop_stop()
