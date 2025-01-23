@@ -6,6 +6,6 @@ WORKDIR /app
 COPY requirements.txt requirements.txt
 RUN pip3 install -r requirements.txt
 
-COPY . .
+COPY ./easee2mqtt.py /app/easee2mqtt.py
 
-CMD ["python", "easee2mqtt.py"]
+CMD ["python", "/app/easee2mqtt.py"]
