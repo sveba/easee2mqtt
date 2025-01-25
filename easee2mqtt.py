@@ -85,10 +85,10 @@ def convert_to_af(code):
     af = f"Unknown state code: {code}"
     if code in [0, 1]:
         af = "A"
-    elif code == 2:
-        af = "B"
     elif code == 3:
         af = "C"
+    else:
+        af = "B"
     return af
 
 
