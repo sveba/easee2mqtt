@@ -21,7 +21,7 @@ This is a Python program.
 3. Run 
 ```
 source config.env
-easee2mqtt.py
+python easee2mqtt.py
 ``` 
 
 ### Published topics
