@@ -8,7 +8,7 @@ import logging
 import paho.mqtt.client as mqtt
 from requests.api import request
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 
 
 LOGLEVEL = os.environ.get('LOGLEVEL', 'INFO').upper()
@@ -17,11 +17,24 @@ easee_password = os.environ.get('EASEE_PASSWORD', None)
 easee_chargers = os.environ.get("EASEE_CHARGERS").split(",")
 polling_interval = int(os.environ.get('POLLING_INTERVAL', 300))
 mqtt_host = os.environ.get('MQTT_HOST', None)
-mqtt_port = int(os.environ.get('MQTT_PORT', 1833))
+mqtt_port = int(os.environ.get('MQTT_PORT', 1883))
 mqtt_password = os.environ.get('MQTT_PASSWORD', None)
 mqtt_username = os.environ.get('MQTT_USERNAME', None)
+mqtt_root_topic = os.environ.get('MQTT_ROOT_TOPIC', 'easee2MQTT').strip("/")
 access_token = None
 token_expiration = time.time()
+charger_serial_numbers = {}
+
+STATE_OBSERVATIONS = {
+    48: "dynamicChargerCurrent",
+    102: "smartCharging",
+    103: "cableLocked",
+    109: "chargerOpMode",
+    120: "totalPower",
+    121: "sessionEnergy",
+    124: "lifetimeEnergy",
+}
+VOLTAGE_OBSERVATIONS = (202, 203, 204, 205, 206, 190, 191, 192, 193, 194, 195, 196, 197, 198, 199)
 
 logging.basicConfig(handlers=[logging.StreamHandler(sys.stdout)],
                     level=LOGLEVEL,
@@ -92,6 +105,15 @@ def convertToAF(code):
     else:
         return f"Unknown state code: {code}"
 
+def mqtt_topic(suffix):
+    return f"{mqtt_root_topic}/{suffix}"
+
+def parse_mqtt_topic(topic):
+    prefix = f"{mqtt_root_topic}/"
+    if not topic.startswith(prefix):
+        return None
+    return topic[len(prefix):].split("/")[0]
+
 def get_latest_session(charger_id):
     global access_token
     check_access_token()
@@ -107,15 +129,100 @@ def get_latest_session(charger_id):
         logging.warning(f"Response code {resp.status_code} when trying to get_latest_session")
     return parsed
 
+def find_serial_number(details):
+    if isinstance(details, dict):
+        for key in ("serialNumber", "serialNo", "serial", "chargerSerialNumber"):
+            if details.get(key):
+                return str(details[key])
+        for value in details.values():
+            serial_number = find_serial_number(value)
+            if serial_number:
+                return serial_number
+    elif isinstance(details, list):
+        for value in details:
+            serial_number = find_serial_number(value)
+            if serial_number:
+                return serial_number
+
+def get_charger_serial_number(charger_id):
+    global access_token, charger_serial_numbers
+    if charger_id not in charger_serial_numbers:
+        check_access_token()
+        url = f"https://api.easee.com/api/chargers/{charger_id}/details"
+        headers = {
+            "Accept": "application/json",
+            "Authorization": "Bearer " + access_token}
+        resp = requests.request("GET", url = url, headers=headers)
+        details = resp.json()
+        if resp.status_code != 200:
+            logging.warning(f"Response code {resp.status_code} when trying to get charger details")
+        charger_serial_numbers[charger_id] = find_serial_number(details)
+        if not charger_serial_numbers[charger_id]:
+            raise KeyError(f"Could not find serial number in charger details for {charger_id}")
+    return charger_serial_numbers[charger_id]
+
+def _observation_id(observation):
+    return observation.get("id") or observation.get("observationId") or observation.get("ID")
+
+def _observation_value(observation):
+    return observation.get("value", observation.get("Value"))
+
+def _observation_timestamp(observation):
+    return observation.get("timestamp") or observation.get("Timestamp")
+
+def _typed_observation_value(observation_id, value):
+    if observation_id in (102, 103):
+        return str(value).casefold() == "true" if isinstance(value, str) else value
+    if observation_id == 109:
+        return int(value)
+    if observation_id in STATE_OBSERVATIONS or observation_id in VOLTAGE_OBSERVATIONS:
+        return float(value)
+    return value
+
+def observations_to_state(observations):
+    if isinstance(observations, dict):
+        observations = observations.get("data") or observations.get("observations") or []
+
+    state = {}
+    latest_pulse = None
+    voltages = {}
+
+    for observation in observations:
+        observation_id = _observation_id(observation)
+        value = _observation_value(observation)
+        timestamp = _observation_timestamp(observation)
+        value = _typed_observation_value(observation_id, value)
+
+        if observation_id in STATE_OBSERVATIONS:
+            state[STATE_OBSERVATIONS[observation_id]] = value
+        elif observation_id in VOLTAGE_OBSERVATIONS:
+            voltages[observation_id] = value
+
+        if timestamp and (latest_pulse is None or timestamp > latest_pulse):
+            latest_pulse = timestamp
+
+    for observation_id in VOLTAGE_OBSERVATIONS:
+        if observation_id in voltages:
+            state["voltage"] = voltages[observation_id]
+            break
+
+    state["latestPulse"] = latest_pulse
+    return state
+
+def format_latest_pulse(value):
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(tz=None).strftime("%Y-%m-%d %H:%M:%S")
+
 def get_state(charger_id):
     global access_token
     check_access_token()
-    url = f"https://api.easee.cloud/api/chargers/{charger_id}/state"
+    ids = ",".join(str(id) for id in (*STATE_OBSERVATIONS, *VOLTAGE_OBSERVATIONS))
+    serial_number = get_charger_serial_number(charger_id)
+    url = f"https://api.easee.com/state/{serial_number}/observations"
     headers = {
         "Accept": "application/json",
         "Authorization": "Bearer " + access_token}
-    resp = requests.request("GET", url = url, headers=headers)
-    parsed = resp.json()
+    resp = requests.request("GET", url = url, headers=headers, params={"ids": ids})
+    parsed = observations_to_state(resp.json())
     logging.debug("State")
     logging.debug(parsed)
     if resp.status_code != 200:
@@ -127,39 +234,42 @@ def publish_state(client, charger):
     state = get_state(charger)
     config = get_config(charger)
     latest_session = get_latest_session(charger)
-    latest_pulse = datetime.strptime(state['latestPulse'], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc).astimezone(tz=None).strftime("%Y-%m-%d %H:%M:%S")
+    latest_pulse = format_latest_pulse(state['latestPulse'])
     logging.debug(f"Publish_state - Latest pulse: {latest_pulse}")
 
-    client.publish(f"easee2MQTT/{charger}/energy_consumption", round(state['lifetimeEnergy'],2))
-    client.publish(f"easee2MQTT/{charger}/current_session", round(state['sessionEnergy'],2))
-    client.publish(f"easee2MQTT/{charger}/previous_session", round(latest_session['sessionEnergy'],2))
-    client.publish(f"easee2MQTT/{charger}/voltage", round(state['voltage'],1))
-    client.publish(f"easee2MQTT/{charger}/power", round(state['totalPower'],2))
-    client.publish(f"easee2MQTT/{charger}/cable_lock", state['cableLocked'])
-    client.publish(f"easee2MQTT/{charger}/charging_enabled", config['isEnabled'])
-    client.publish(f"easee2MQTT/{charger}/smartcharging_enabled", state['smartCharging'])
-    client.publish(f"easee2MQTT/{charger}/latest_pulse", latest_pulse)
-    client.publish(f"easee2MQTT/{charger}/charging_current", state['dynamicChargerCurrent'])
-    client.publish(f"easee2MQTT/{charger}/chargerOpMode", convertToAF(state['chargerOpMode']))
+    client.publish(mqtt_topic("energy_consumption"), round(state['lifetimeEnergy'],2))
+    client.publish(mqtt_topic("current_session"), round(state['sessionEnergy'],2))
+    client.publish(mqtt_topic("previous_session"), round(latest_session['sessionEnergy'],2))
+    client.publish(mqtt_topic("voltage"), round(state['voltage'],1))
+    client.publish(mqtt_topic("power"), round(state['totalPower'],2))
+    client.publish(mqtt_topic("cable_lock"), state['cableLocked'])
+    client.publish(mqtt_topic("charging_enabled"), config['isEnabled'])
+    client.publish(mqtt_topic("smartcharging_enabled"), state['smartCharging'])
+    client.publish(mqtt_topic("latest_pulse"), latest_pulse)
+    client.publish(mqtt_topic("charging_current"), state['dynamicChargerCurrent'])
+    client.publish(mqtt_topic("chargerOpMode"), convertToAF(state['chargerOpMode']))
 
 
 def on_message(client, userdata, message):
     logging.info(f"Message received on topic: {message.topic}, payload: {str(message.payload.decode('utf-8'))}")
     global access_token
-    charger = message.topic.split("/")[1]
+    charger = easee_chargers[0]
+    setting = parse_mqtt_topic(message.topic)
+    if not setting:
+        return
     headers = {
             "Accept": "application/json",
             "Authorization": "Bearer " + access_token}
 
-    if message.topic.split("/")[2] == "cable_lock":
+    if setting == "cable_lock":
         url = "https://api.easee.cloud/api/chargers/"+charger+"/commands/lock_state"
         data = {
             "state": str(message.payload.decode("utf-8"))
         }
         resp = requests.post(url, headers= headers, json = data)
-        callback_topic = f"easee2MQTT/{charger}/cable_lock"
+        callback_topic = mqtt_topic("cable_lock")
 
-    elif message.topic.split("/")[2] == "charging_enabled":
+    elif setting == "charging_enabled":
         url = "https://api.easee.cloud/api/chargers/"+charger+"/settings"
         if (str(message.payload.decode("utf-8")).casefold() == "true" or
             str(message.payload.decode("utf-8")).casefold() == "false"):
@@ -167,12 +277,12 @@ def on_message(client, userdata, message):
                 'enabled' : str(message.payload.decode("utf-8")).title()
             }
             resp = requests.post(url, headers=headers, json = data)
-            callback_topic = f"easee2MQTT/{charger}/charging_enabled"
+            callback_topic = mqtt_topic("charging_enabled")
 
         else:
             logging.warning("Couldn't identify payload. 'true' or 'false' is only supported values.")
 
-    elif message.topic.split("/")[2] == "smartcharging_enabled":
+    elif setting == "smartcharging_enabled":
         if (str(message.payload.decode("utf-8")).casefold() == "true" or
             str(message.payload.decode("utf-8")).casefold() == "false"):
             url = "https://api.easee.cloud/api/chargers/"+charger+"/settings"
@@ -180,22 +290,22 @@ def on_message(client, userdata, message):
                 "smartCharging" : message.payload.decode("utf-8").title()
             }
             resp = requests.post(url, headers=headers, json = data)
-            callback_topic = f"easee2MQTT/{charger}/smartcharging_enabled"
+            callback_topic = mqtt_topic("smartcharging_enabled")
 
-    elif message.topic.split("/")[2] == "charging_current":
+    elif setting == "charging_current":
         if float(message.payload.decode('utf-8')) < 33.0:
             url = "https://api.easee.cloud/api/chargers/"+charger+"/settings"
             data = {
                 "dynamicChargerCurrent" : message.payload.decode('utf-8')
             }
             resp = requests.post(url, headers=headers, json = data)
-            callback_topic = f"easee2MQTT/{charger}/charging_current"
+            callback_topic = mqtt_topic("charging_current")
         else:
             logging.warning(f"Couldn't publish new charging_current")
     
     try:
-        if message.topic.split("/")[2] != "ping":
-            logging.info(f"Manually publishing setting {message.topic.split('/')[2]} for {charger}")
+        if setting != "ping":
+            logging.info(f"Manually publishing setting {setting} for {charger}")
             client.publish(callback_topic, message.payload.decode('utf-8')) 
     except:
         logging.warning(f"Couldn't publish manually for message: {message}")
@@ -231,13 +341,12 @@ def main():
     client.connect(mqtt_host, mqtt_port)
     client.loop_start()
 
-    for charger in easee_chargers:
-        logging.info(f"Subscribing to topics for charger {charger}.")
-        client.subscribe("easee2MQTT/"+charger+"/cable_lock/set")
-        client.subscribe("easee2MQTT/"+charger+"/charging_enabled/set")
-        client.subscribe("easee2MQTT/"+charger+"/ping")
-        client.subscribe("easee2MQTT/"+charger+"/smartcharging_enabled/set")
-        client.subscribe("easee2MQTT/"+charger+"/charging_current/set")
+    logging.info(f"Subscribing to topics below {mqtt_root_topic}.")
+    client.subscribe(mqtt_topic("cable_lock/set"))
+    client.subscribe(mqtt_topic("charging_enabled/set"))
+    client.subscribe(mqtt_topic("ping"))
+    client.subscribe(mqtt_topic("smartcharging_enabled/set"))
+    client.subscribe(mqtt_topic("charging_current/set"))
     client.on_message = on_message
 
     try:
